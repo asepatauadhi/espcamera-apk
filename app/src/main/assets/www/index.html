@@ -1,0 +1,534 @@
+<!doctype html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Kamera pendeteksi orang</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@400;600&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --bg:#0d1520; --panel:#152130; --line:#243449;
+    --text:#e6eef7; --muted:#8fa3b8; --accent:#3dd6f5; --accent-ink:#06222b;
+  }
+  *{box-sizing:border-box}
+  html,body{height:100%;margin:0}
+  body{background:var(--bg);color:var(--text);font-family:"Chakra Petch",system-ui,sans-serif;-webkit-tap-highlight-color:transparent}
+  main{height:100dvh;display:flex;flex-direction:column;max-width:1000px;margin:0 auto}
+
+  .bar{display:flex;justify-content:space-between;gap:12px;padding:10px 14px;font-size:14px;color:var(--muted)}
+  .bar b{color:var(--text);font-weight:600}
+
+  .stage{position:relative;flex:1;min-height:0;background:#070c13;border-block:1px solid var(--line)}
+  canvas{position:absolute;inset:0;width:100%;height:100%;object-fit:contain;display:block}
+  #video{position:absolute;width:1px;height:1px;opacity:0;pointer-events:none}
+
+  .empty{position:absolute;inset:0;display:grid;place-content:center;justify-items:center;gap:14px;text-align:center;padding:24px}
+  .empty[hidden]{display:none}
+  .empty h1{margin:0;font-size:22px;font-weight:600}
+  .empty p{margin:0;max-width:34ch;color:var(--muted);font-size:15px;line-height:1.5}
+  #msg{color:#ff8a8a}
+
+  .people{display:flex;gap:8px;overflow-x:auto;padding:10px 14px;min-height:56px;align-items:center;scrollbar-width:thin}
+  .people .none{color:var(--muted);font-size:14px}
+  .chip{flex:none;display:flex;align-items:center;gap:8px;background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:8px 10px;font-size:13px;white-space:nowrap}
+  .chip i{width:10px;height:10px;border-radius:50%;display:block}
+
+  .controls{display:flex;flex-wrap:wrap;gap:8px;padding:4px 14px calc(12px + env(safe-area-inset-bottom))}
+  button{font:inherit;font-size:14px;min-height:44px;padding:0 16px;border-radius:8px;border:1px solid var(--line);background:var(--panel);color:var(--text);cursor:pointer}
+  button:disabled{opacity:.5;cursor:default}
+  button:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+  button.primary{background:var(--accent);border-color:var(--accent);color:var(--accent-ink);font-weight:600}
+  button[aria-pressed="true"]{border-color:var(--accent);color:var(--accent)}
+  .note{padding:0 14px 10px;font-size:12px;color:var(--muted);line-height:1.5}
+</style>
+</head>
+<body>
+<main>
+  <header class="bar">
+    <span id="status"><b>Kamera belum aktif</b></span>
+    <span id="stats"></span>
+  </header>
+
+  <section class="stage">
+    <canvas id="view" width="640" height="480"></canvas>
+    <video id="video" playsinline muted></video>
+    <div class="empty" id="empty">
+      <h1>Deteksi orang lewat kamera</h1>
+      <p>Setiap orang diberi kotak ESP lengkap dengan perkiraan gender, umur, ekspresi, dan pose.</p>
+      <button class="primary" id="start">Mulai kamera</button>
+      <p id="msg"></p>
+    </div>
+  </section>
+
+  <section class="people" id="people" aria-live="polite"></section>
+
+  <nav class="controls">
+    <button id="flip" disabled>Ganti kamera</button>
+    <button class="tog" data-opt="skeleton" aria-pressed="true">Kerangka</button>
+    <button class="tog" data-opt="tracer" aria-pressed="true">Garis tracer</button>
+    <button class="tog" data-opt="mirror" aria-pressed="true">Cermin</button>
+    <button id="snap" disabled>Simpan foto</button>
+  </nav>
+  <p class="note">Semua diproses di perangkatmu, tidak ada video yang dikirim ke server. Gender dan umur hanya perkiraan model dan bisa meleset.</p>
+</main>
+
+<script src="https://cdn.jsdelivr.net/npm/@vladmandic/face-api/dist/face-api.js"></script>
+<script type="module">
+import { PoseLandmarker, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
+
+const $ = s => document.querySelector(s);
+const video = $('#video'), canvas = $('#view'), ctx = canvas.getContext('2d');
+const statusEl = $('#status'), statsEl = $('#stats'), peopleEl = $('#people');
+const emptyEl = $('#empty'), msgEl = $('#msg');
+const startBtn = $('#start'), flipBtn = $('#flip'), snapBtn = $('#snap');
+
+const FACE_MODELS = 'https://cdn.jsdelivr.net/npm/@vladmandic/face-api/model/';
+const WASM = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm';
+const POSE_MODEL = 'https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task';
+
+const COLORS = ['#3dd6f5', '#ffb020', '#ff5c8a', '#9be15d', '#b58cff', '#ff8a3d'];
+const EXPR = { neutral:'Netral', happy:'Senang', sad:'Sedih', angry:'Marah', fearful:'Takut', disgusted:'Jijik', surprised:'Terkejut' };
+
+const opt = { skeleton: true, tracer: true, mirror: true };
+let facing = 'user', stream = null, running = false, modelsReady = false, loopOn = false;
+let poseLm = null, W = 640, H = 480;
+let tracks = [], nextId = 1, lastFaces = [], tick = 0, lastTs = 0, fps = 0;
+
+const setStatus = t => { statusEl.innerHTML = ''; const b = document.createElement('b'); b.textContent = t; statusEl.append(b); };
+const mx = x => opt.mirror ? W - x : x;
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+const hexA = (hex, a) => {
+  const n = parseInt(hex.slice(1), 16);
+  return `rgba(${n >> 16},${(n >> 8) & 255},${n & 255},${a})`;
+};
+
+/* ---------- Muat model ---------- */
+async function loadModels() {
+  if (modelsReady) return;
+  setStatus('Memuat model deteksi…');
+  try { await document.fonts.load('600 16px "Chakra Petch"'); } catch {}
+  await Promise.all([
+    faceapi.nets.tinyFaceDetector.loadFromUri(FACE_MODELS),
+    faceapi.nets.faceExpressionNet.loadFromUri(FACE_MODELS),
+    faceapi.nets.ageGenderNet.loadFromUri(FACE_MODELS),
+  ]);
+  const fileset = await FilesetResolver.forVisionTasks(WASM);
+  const make = delegate => PoseLandmarker.createFromOptions(fileset, {
+    baseOptions: { modelAssetPath: POSE_MODEL, delegate },
+    runningMode: 'VIDEO',
+    numPoses: 4,
+  });
+  try { poseLm = await make('GPU'); } catch { poseLm = await make('CPU'); }
+  modelsReady = true;
+}
+
+/* ---------- Kamera ---------- */
+function stopStream() {
+  if (stream) stream.getTracks().forEach(t => t.stop());
+  stream = null;
+}
+async function startCamera() {
+  stopStream();
+  stream = await navigator.mediaDevices.getUserMedia({
+    video: { facingMode: facing, width: { ideal: 960 }, height: { ideal: 540 } },
+    audio: false,
+  });
+  video.srcObject = stream;
+  await video.play();
+  W = canvas.width = video.videoWidth;
+  H = canvas.height = video.videoHeight;
+  opt.mirror = facing === 'user';
+  $('[data-opt="mirror"]').setAttribute('aria-pressed', String(opt.mirror));
+  tracks = [];
+}
+
+function showError(e) {
+  let m = e && e.message ? e.message : String(e);
+  if (e && e.name === 'NotAllowedError') m = 'Izin kamera ditolak. Aktifkan izin kamera di pengaturan browser, lalu coba lagi.';
+  if (e && e.name === 'NotFoundError') m = 'Kamera tidak ditemukan di perangkat ini.';
+  if (!navigator.mediaDevices) m = 'Kamera hanya bisa dipakai lewat HTTPS atau localhost.';
+  msgEl.textContent = m;
+  emptyEl.hidden = false;
+  running = false;
+  setStatus('Kamera belum aktif');
+}
+
+startBtn.onclick = async () => {
+  startBtn.disabled = true;
+  msgEl.textContent = '';
+  try {
+    await loadModels();
+    setStatus('Membuka kamera…');
+    await startCamera();
+    emptyEl.hidden = true;
+    running = true;
+    flipBtn.disabled = false;
+    snapBtn.disabled = false;
+    setStatus('Mencari orang…');
+    requestAnimationFrame(render);
+    detectLoop();
+  } catch (e) {
+    console.error(e);
+    showError(e);
+  } finally {
+    startBtn.disabled = false;
+  }
+};
+
+flipBtn.onclick = async () => {
+  flipBtn.disabled = true;
+  facing = facing === 'user' ? 'environment' : 'user';
+  try { await startCamera(); } catch (e) { showError(e); }
+  flipBtn.disabled = false;
+};
+
+document.querySelectorAll('.tog').forEach(btn => {
+  btn.onclick = () => {
+    const k = btn.dataset.opt;
+    opt[k] = !opt[k];
+    btn.setAttribute('aria-pressed', String(opt[k]));
+  };
+});
+
+snapBtn.onclick = () => {
+  canvas.toBlob(blob => {
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `deteksi-${Date.now()}.png`;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+  });
+};
+
+/* ---------- Klasifikasi pose ---------- */
+function classifyPose(lm) {
+  const ok = i => lm[i] && (lm[i].visibility ?? 1) > 0.5;
+  const px = i => ({ x: lm[i].x * W, y: lm[i].y * H });
+  const angle = (a, b, c) => {
+    const A = px(a), B = px(b), C = px(c);
+    const v1 = { x: A.x - B.x, y: A.y - B.y }, v2 = { x: C.x - B.x, y: C.y - B.y };
+    const m = Math.hypot(v1.x, v1.y) * Math.hypot(v2.x, v2.y);
+    if (!m) return 180;
+    return Math.acos(clamp((v1.x * v2.x + v1.y * v2.y) / m, -1, 1)) * 180 / Math.PI;
+  };
+
+  let posture = null;
+  if (ok(11) && ok(12) && ok(23) && ok(24)) {
+    const s = { x: (lm[11].x + lm[12].x) / 2 * W, y: (lm[11].y + lm[12].y) / 2 * H };
+    const h = { x: (lm[23].x + lm[24].x) / 2 * W, y: (lm[23].y + lm[24].y) / 2 * H };
+    const dx = Math.abs(s.x - h.x), dy = Math.abs(s.y - h.y);
+    if (dy < dx * 0.8) {
+      posture = 'Berbaring';
+    } else {
+      const angs = [];
+      if (ok(25) && ok(27)) angs.push(angle(23, 25, 27));
+      if (ok(26) && ok(28)) angs.push(angle(24, 26, 28));
+      if (angs.length) {
+        const a = angs.reduce((p, c) => p + c) / angs.length;
+        posture = a < 125 ? 'Duduk / jongkok' : 'Berdiri';
+      } else if (ok(25) || ok(26)) {
+        const kneeY = (ok(25) ? lm[25].y : lm[26].y) * H;
+        posture = (kneeY - h.y) < Math.hypot(dx, dy) * 0.6 ? 'Duduk' : 'Berdiri';
+      } else {
+        posture = 'Setengah badan';
+      }
+    }
+  } else if (ok(11) && ok(12)) {
+    posture = 'Setengah badan';
+  }
+
+  const parts = [];
+  const ref = ok(0) ? lm[0].y : (ok(11) && ok(12) ? Math.min(lm[11].y, lm[12].y) : null);
+  if (ref != null) {
+    const up = [15, 16].filter(i => ok(i) && lm[i].y < ref).length;
+    if (up === 2) parts.push('dua tangan terangkat');
+    else if (up === 1) parts.push('satu tangan terangkat');
+  }
+  if (ok(7) && ok(8)) {
+    const a = px(7), b = px(8);
+    const tilt = Math.abs(Math.atan2(b.y - a.y, Math.abs(b.x - a.x))) * 180 / Math.PI;
+    if (tilt > 14) parts.push('kepala miring');
+  }
+
+  if (posture) return posture + (parts.length ? ' · ' + parts.join(', ') : '');
+  if (parts.length) return parts[0][0].toUpperCase() + parts.join(', ').slice(1);
+  return 'Pose belum jelas';
+}
+
+/* ---------- Gabungkan pose + wajah ---------- */
+function buildDetections(poses, faces) {
+  const dets = [];
+  const usedFace = new Set();
+
+  for (const lm of poses) {
+    const pts = lm.filter(p => (p.visibility ?? 1) > 0.3);
+    if (pts.length < 5) continue;
+    let x1 = Math.min(...pts.map(p => p.x)) * W, x2 = Math.max(...pts.map(p => p.x)) * W;
+    let y1 = Math.min(...pts.map(p => p.y)) * H, y2 = Math.max(...pts.map(p => p.y)) * H;
+    const padX = (x2 - x1) * 0.1;
+    x1 -= padX; x2 += padX;
+    y1 -= (y2 - y1) * 0.12;
+    y2 += (y2 - y1) * 0.04;
+
+    let face = null, fi = -1, best = Infinity;
+    faces.forEach((f, i) => {
+      if (usedFace.has(i)) return;
+      const b = f.detection.box;
+      const cx = b.x + b.width / 2, cy = b.y + b.height / 2;
+      if (cx >= x1 && cx <= x2 && cy >= y1 && cy <= y2) {
+        const d = Math.hypot(cx - lm[0].x * W, cy - lm[0].y * H);
+        if (d < best) { best = d; face = f; fi = i; }
+      }
+    });
+    if (face) {
+      usedFace.add(fi);
+      const b = face.detection.box;
+      y1 = Math.min(y1, b.y - b.height * 0.35);
+      x1 = Math.min(x1, b.x); x2 = Math.max(x2, b.x + b.width);
+    }
+    x1 = clamp(x1, 0, W); x2 = clamp(x2, 0, W);
+    y1 = clamp(y1, 0, H); y2 = clamp(y2, 0, H);
+    dets.push({ box: { x: x1, y: y1, w: x2 - x1, h: y2 - y1 }, lm, pose: classifyPose(lm), face });
+  }
+
+  faces.forEach((f, i) => {
+    if (usedFace.has(i)) return;
+    const b = f.detection.box;
+    const x1 = clamp(b.x - b.width * 0.15, 0, W), y1 = clamp(b.y - b.height * 0.3, 0, H);
+    const x2 = clamp(b.x + b.width * 1.15, 0, W), y2 = clamp(b.y + b.height * 1.2, 0, H);
+    dets.push({ box: { x: x1, y: y1, w: x2 - x1, h: y2 - y1 }, lm: null, pose: null, face: f });
+  });
+  return dets;
+}
+
+/* ---------- Pelacak sederhana + penghalusan ---------- */
+function updateTracks(dets, now) {
+  const used = new Set();
+  for (const d of dets) {
+    const cx = d.box.x + d.box.w / 2, cy = d.box.y + d.box.h / 2;
+    let hit = null, bd = W * 0.25;
+    for (const t of tracks) {
+      if (used.has(t)) continue;
+      const dd = Math.hypot(t.cx - cx, t.cy - cy);
+      if (dd < bd) { bd = dd; hit = t; }
+    }
+    if (!hit) {
+      const id = nextId++;
+      hit = { id, color: COLORS[(id - 1) % COLORS.length], box: { ...d.box }, age: null, male: null, expr: null };
+      tracks.push(hit);
+    }
+    used.add(hit);
+    hit.cx = cx; hit.cy = cy; hit.seen = now;
+    for (const k of ['x', 'y', 'w', 'h']) hit.box[k] += (d.box[k] - hit.box[k]) * 0.5;
+    hit.lm = d.lm;
+    hit.pose = d.pose;
+
+    if (d.face) {
+      const f = d.face;
+      hit.age = hit.age == null ? f.age : hit.age * 0.85 + f.age * 0.15;
+      const pm = f.gender === 'male' ? f.genderProbability : 1 - f.genderProbability;
+      hit.male = hit.male == null ? pm : hit.male * 0.85 + pm * 0.15;
+      hit.expr = hit.expr || {};
+      for (const k of Object.keys(EXPR)) {
+        const v = f.expressions[k];
+        hit.expr[k] = hit.expr[k] == null ? v : hit.expr[k] * 0.6 + v * 0.4;
+      }
+    }
+  }
+  tracks = tracks.filter(t => now - t.seen < 1500);
+}
+
+function describe(t) {
+  const info = { gender: null, age: null, expr: null };
+  if (t.male != null) {
+    const male = t.male >= 0.5;
+    info.gender = `${male ? 'Pria' : 'Wanita'} ${Math.round((male ? t.male : 1 - t.male) * 100)}%`;
+    info.age = `~${Math.round(t.age)} th`;
+  }
+  if (t.expr) {
+    const [k, v] = Object.entries(t.expr).sort((a, b) => b[1] - a[1])[0];
+    info.expr = `${EXPR[k]} ${Math.round(v * 100)}%`;
+  }
+  return info;
+}
+
+/* ---------- Loop deteksi ---------- */
+async function detectLoop() {
+  if (loopOn) return;
+  loopOn = true;
+  let lastVT = -1, lastUi = 0, prev = performance.now();
+  const faceOpts = new faceapi.TinyFaceDetectorOptions({ inputSize: 320, scoreThreshold: 0.45 });
+
+  while (running) {
+    if (video.readyState >= 2 && video.currentTime !== lastVT) {
+      lastVT = video.currentTime;
+      let poses = [];
+      try {
+        lastTs = Math.max(performance.now(), lastTs + 1);
+        poses = poseLm.detectForVideo(video, lastTs).landmarks || [];
+      } catch (e) { console.warn(e); }
+
+      if (tick++ % 2 === 0) {
+        try {
+          lastFaces = await faceapi.detectAllFaces(video, faceOpts).withFaceExpressions().withAgeAndGender();
+        } catch (e) { console.warn(e); }
+      }
+
+      const now = performance.now();
+      updateTracks(buildDetections(poses, lastFaces), now);
+      const dt = now - prev; prev = now;
+      fps = fps ? fps * 0.9 + (1000 / dt) * 0.1 : 1000 / dt;
+      if (now - lastUi > 250) { lastUi = now; updateUi(now); }
+    }
+    await new Promise(r => requestAnimationFrame(r));
+  }
+  loopOn = false;
+}
+
+function updateUi(now) {
+  const active = tracks.filter(t => now - t.seen < 500);
+  statsEl.textContent = `${active.length} orang · ${Math.round(fps)} FPS`;
+  setStatus(active.length ? 'Mendeteksi' : 'Mencari orang…');
+
+  peopleEl.replaceChildren();
+  if (!active.length) {
+    const p = document.createElement('span');
+    p.className = 'none';
+    p.textContent = 'Belum ada orang di depan kamera.';
+    peopleEl.append(p);
+    return;
+  }
+  for (const t of active) {
+    const i = describe(t);
+    const chip = document.createElement('div');
+    chip.className = 'chip';
+    const dot = document.createElement('i');
+    dot.style.background = t.color;
+    const txt = document.createElement('span');
+    txt.textContent = [`Orang ${t.id}`, i.gender, i.age, i.expr, t.pose].filter(Boolean).join(' · ');
+    chip.append(dot, txt);
+    peopleEl.append(chip);
+  }
+}
+
+/* ---------- Gambar ---------- */
+function render() {
+  if (!running) return;
+  ctx.save();
+  if (opt.mirror) { ctx.translate(W, 0); ctx.scale(-1, 1); }
+  ctx.drawImage(video, 0, 0, W, H);
+  ctx.restore();
+  ctx.fillStyle = 'rgba(7,12,19,.18)';
+  ctx.fillRect(0, 0, W, H);
+
+  const now = performance.now();
+  for (const t of tracks) if (now - t.seen < 500) drawPerson(t);
+  requestAnimationFrame(render);
+}
+
+function drawSkeleton(t) {
+  const lm = t.lm, lw = Math.max(2, W / 320);
+  ctx.save();
+  ctx.strokeStyle = hexA(t.color, .9);
+  ctx.fillStyle = '#fff';
+  ctx.lineWidth = lw;
+  ctx.lineCap = 'round';
+  const vis = i => (lm[i].visibility ?? 1) > 0.5;
+  for (const c of PoseLandmarker.POSE_CONNECTIONS) {
+    if (c.start <= 10 && c.end <= 10) continue;
+    if (!vis(c.start) || !vis(c.end)) continue;
+    ctx.beginPath();
+    ctx.moveTo(mx(lm[c.start].x * W), lm[c.start].y * H);
+    ctx.lineTo(mx(lm[c.end].x * W), lm[c.end].y * H);
+    ctx.stroke();
+  }
+  for (let i = 0; i < lm.length; i++) {
+    if (i >= 1 && i <= 10) continue;
+    if (!vis(i)) continue;
+    ctx.beginPath();
+    ctx.arc(mx(lm[i].x * W), lm[i].y * H, lw * 1.4, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  ctx.restore();
+}
+
+function roundRect(x, y, w, h, r) {
+  ctx.beginPath();
+  if (ctx.roundRect) ctx.roundRect(x, y, w, h, r); else ctx.rect(x, y, w, h);
+}
+
+function drawPerson(t) {
+  const fs = Math.max(12, Math.round(W / 46));
+  const lw = Math.max(2, W / 320);
+  const b = t.box;
+  const xa = mx(b.x), xb = mx(b.x + b.w);
+  const L = Math.min(xa, xb), R = Math.max(xa, xb), T = b.y, B = b.y + b.h;
+  const w = R - L, h = B - T;
+
+  ctx.save();
+  ctx.lineWidth = lw;
+  ctx.lineJoin = 'round';
+  ctx.lineCap = 'round';
+  ctx.strokeStyle = t.color;
+
+  if (opt.tracer) {
+    ctx.globalAlpha = .5;
+    ctx.beginPath();
+    ctx.moveTo(W / 2, H);
+    ctx.lineTo(L + w / 2, B);
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+  }
+
+  ctx.fillStyle = hexA(t.color, .07);
+  ctx.fillRect(L, T, w, h);
+
+  const c = Math.min(w, h) * 0.22;
+  ctx.lineWidth = lw * 1.5;
+  ctx.beginPath();
+  ctx.moveTo(L, T + c); ctx.lineTo(L, T); ctx.lineTo(L + c, T);
+  ctx.moveTo(R - c, T); ctx.lineTo(R, T); ctx.lineTo(R, T + c);
+  ctx.moveTo(R, B - c); ctx.lineTo(R, B); ctx.lineTo(R - c, B);
+  ctx.moveTo(L + c, B); ctx.lineTo(L, B); ctx.lineTo(L, B - c);
+  ctx.stroke();
+  ctx.restore();
+
+  if (opt.skeleton && t.lm) drawSkeleton(t);
+
+  // Kartu informasi
+  const i = describe(t);
+  const lines = [{ text: `Orang ${t.id}`, bold: true }];
+  lines.push({ text: i.gender ? `${i.gender} · ${i.age}` : 'Mencari wajah…', dim: !i.gender });
+  if (i.expr) lines.push({ text: i.expr });
+  if (t.pose) lines.push({ text: t.pose });
+
+  const pad = fs * 0.55, lh = fs * 1.4, accent = fs * 0.25;
+  ctx.save();
+  let tw = 0;
+  for (const l of lines) {
+    ctx.font = `${l.bold ? 600 : 400} ${fs}px "Chakra Petch", system-ui, sans-serif`;
+    tw = Math.max(tw, ctx.measureText(l.text).width);
+  }
+  const cw = tw + pad * 2 + accent, ch = lines.length * lh + pad * 0.8;
+  let cx = clamp(L, 0, Math.max(0, W - cw));
+  let cy = T - ch - 6;
+  if (cy < 0) cy = Math.min(T + 6, H - ch);
+
+  ctx.fillStyle = 'rgba(8,12,20,.8)';
+  roundRect(cx, cy, cw, ch, 6); ctx.fill();
+  ctx.fillStyle = t.color;
+  roundRect(cx, cy, accent, ch, 3); ctx.fill();
+
+  ctx.textBaseline = 'middle';
+  lines.forEach((l, n) => {
+    ctx.font = `${l.bold ? 600 : 400} ${fs}px "Chakra Petch", system-ui, sans-serif`;
+    ctx.fillStyle = l.bold ? t.color : (l.dim ? '#8fa3b8' : '#e6eef7');
+    ctx.fillText(l.text, cx + accent + pad, cy + pad * 0.4 + lh * (n + 0.5));
+  });
+  ctx.restore();
+}
+</script>
+</body>
+</html>
